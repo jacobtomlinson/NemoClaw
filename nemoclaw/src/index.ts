@@ -208,9 +208,7 @@ export interface OpenClawPluginApi {
   resolvePath: (input: string) => string;
   on: (
     hookName: string,
-    handler: (
-      ...args: readonly PluginValue[]
-    ) => HookResult | Promise<HookResult>,
+    handler: (...args: readonly PluginValue[]) => HookResult | Promise<HookResult>,
   ) => void;
 }
 

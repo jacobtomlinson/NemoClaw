@@ -270,7 +270,9 @@ filesystem_policy:
       "policy get openclaw": POLICY_SUMMARY,
     });
     const summary = await getRuntimeSummary(defaultConfig);
-    expect(summary.networkLines.some((l) => l.includes("additional network rule(s) omitted"))).toBe(true);
+    expect(summary.networkLines.some((l) => l.includes("additional network rule(s) omitted"))).toBe(
+      true,
+    );
   });
 
   it("returns sandboxed filesystem line when no filesystem_policy in YAML", async () => {
@@ -336,7 +338,11 @@ describe("registerRuntimeContext", () => {
     it("prependContext opens and closes nemoclaw-runtime tags", async () => {
       const { api } = makeMockApi();
       registerRuntimeContext(api, defaultConfig);
-      const result = (await api._trigger("before_agent_start", {}, { sessionKey: nextSessionKey() })) as {
+      const result = (await api._trigger(
+        "before_agent_start",
+        {},
+        { sessionKey: nextSessionKey() },
+      )) as {
         prependContext: string;
       };
       expect(result.prependContext).toContain("<nemoclaw-runtime>");
@@ -346,7 +352,11 @@ describe("registerRuntimeContext", () => {
     it("includes the sandbox name in the context", async () => {
       const { api } = makeMockApi();
       registerRuntimeContext(api, defaultConfig);
-      const result = (await api._trigger("before_agent_start", {}, { sessionKey: nextSessionKey() })) as {
+      const result = (await api._trigger(
+        "before_agent_start",
+        {},
+        { sessionKey: nextSessionKey() },
+      )) as {
         prependContext: string;
       };
       expect(result.prependContext).toContain('"openclaw"');
@@ -355,7 +365,11 @@ describe("registerRuntimeContext", () => {
     it("includes sandbox phase when available", async () => {
       const { api } = makeMockApi();
       registerRuntimeContext(api, defaultConfig);
-      const result = (await api._trigger("before_agent_start", {}, { sessionKey: nextSessionKey() })) as {
+      const result = (await api._trigger(
+        "before_agent_start",
+        {},
+        { sessionKey: nextSessionKey() },
+      )) as {
         prependContext: string;
       };
       expect(result.prependContext).toContain("Running");
@@ -364,7 +378,11 @@ describe("registerRuntimeContext", () => {
     it("includes Network policy section header", async () => {
       const { api } = makeMockApi();
       registerRuntimeContext(api, defaultConfig);
-      const result = (await api._trigger("before_agent_start", {}, { sessionKey: nextSessionKey() })) as {
+      const result = (await api._trigger(
+        "before_agent_start",
+        {},
+        { sessionKey: nextSessionKey() },
+      )) as {
         prependContext: string;
       };
       expect(result.prependContext).toContain("Network policy:");
@@ -373,7 +391,11 @@ describe("registerRuntimeContext", () => {
     it("includes Filesystem policy section header", async () => {
       const { api } = makeMockApi();
       registerRuntimeContext(api, defaultConfig);
-      const result = (await api._trigger("before_agent_start", {}, { sessionKey: nextSessionKey() })) as {
+      const result = (await api._trigger(
+        "before_agent_start",
+        {},
+        { sessionKey: nextSessionKey() },
+      )) as {
         prependContext: string;
       };
       expect(result.prependContext).toContain("Filesystem policy:");
@@ -382,7 +404,11 @@ describe("registerRuntimeContext", () => {
     it("includes Behavior section with internet access instruction", async () => {
       const { api } = makeMockApi();
       registerRuntimeContext(api, defaultConfig);
-      const result = (await api._trigger("before_agent_start", {}, { sessionKey: nextSessionKey() })) as {
+      const result = (await api._trigger(
+        "before_agent_start",
+        {},
+        { sessionKey: nextSessionKey() },
+      )) as {
         prependContext: string;
       };
       expect(result.prependContext).toContain("do not claim unrestricted internet access");
@@ -424,7 +450,9 @@ describe("registerRuntimeContext", () => {
         "policy get openclaw": POLICY_SUMMARY,
       });
 
-      const result = (await api._trigger("before_agent_start", {}, key)) as { prependContext: string };
+      const result = (await api._trigger("before_agent_start", {}, key)) as {
+        prependContext: string;
+      };
       expect(result.prependContext).toContain("<nemoclaw-runtime-update>");
       expect(result.prependContext).toContain("Running -> Stopped");
     });
@@ -459,7 +487,9 @@ describe("registerRuntimeContext", () => {
         "policy get openclaw": "Version: 2.0\nHash: new123\nStatus: active",
       });
 
-      const result = (await api._trigger("before_agent_start", {}, key)) as { prependContext: string };
+      const result = (await api._trigger("before_agent_start", {}, key)) as {
+        prependContext: string;
+      };
       expect(result.prependContext).toContain("NVIDIA API");
     });
   });
@@ -472,13 +502,19 @@ describe("registerRuntimeContext", () => {
 
       const { api, warnMessages } = makeMockApi();
       registerRuntimeContext(api, defaultConfig);
-      const result = (await api._trigger("before_agent_start", {}, { sessionKey: nextSessionKey() })) as {
+      const result = (await api._trigger(
+        "before_agent_start",
+        {},
+        { sessionKey: nextSessionKey() },
+      )) as {
         prependContext: string;
       };
 
       expect(result.prependContext).toContain("<nemoclaw-runtime>");
       expect(result.prependContext).toContain("deny-by-default");
-      expect(warnMessages.some((m) => m.includes("nemoclaw runtime context injection failed"))).toBe(true);
+      expect(
+        warnMessages.some((m) => m.includes("nemoclaw runtime context injection failed")),
+      ).toBe(true);
     });
 
     it("includes the sandbox name from pluginConfig in the fallback block", async () => {
@@ -488,7 +524,11 @@ describe("registerRuntimeContext", () => {
 
       const { api } = makeMockApi();
       registerRuntimeContext(api, defaultConfig);
-      const result = (await api._trigger("before_agent_start", {}, { sessionKey: nextSessionKey() })) as {
+      const result = (await api._trigger(
+        "before_agent_start",
+        {},
+        { sessionKey: nextSessionKey() },
+      )) as {
         prependContext: string;
       };
       expect(result.prependContext).toContain('"openclaw"');
