@@ -18,7 +18,7 @@ vi.mock("./blueprint/state.js", () => ({
 }));
 
 const { execFile } = await import("node:child_process");
-const { loadState } = await import("./blueprint/state.js");
+const { loadState } = (await import("./blueprint/state.js")) as { loadState: () => NemoClawState };
 const { getRuntimeSummary, registerRuntimeContext } = await import("./runtime-context.js");
 
 // ---------------------------------------------------------------------------
