@@ -126,19 +126,16 @@ function normalizePolicyYaml(output: string | null): string | null {
  * access type, preferring explicit `access` field, then rule count, then protocol.
  */
 function describeEndpointAccess(endpoint: Record<string, unknown>): string {
-  if (typeof endpoint["access"] === "string" && (endpoint["access"]).trim().length > 0) {
-    return (endpoint["access"]).trim();
+  if (typeof endpoint["access"] === "string" && endpoint["access"].trim().length > 0) {
+    return endpoint["access"].trim();
   }
   const rules = Array.isArray(endpoint["rules"]) ? endpoint["rules"] : [];
   if (rules.length > 0) {
     const ruleCount = String(rules.length);
     return `${ruleCount} custom rule${rules.length === 1 ? "" : "s"}`;
   }
-  if (
-    typeof endpoint["protocol"] === "string" &&
-    (endpoint["protocol"]).trim().length > 0
-  ) {
-    return (endpoint["protocol"]).trim();
+  if (typeof endpoint["protocol"] === "string" && endpoint["protocol"].trim().length > 0) {
+    return endpoint["protocol"].trim();
   }
   return "explicit allow";
 }
