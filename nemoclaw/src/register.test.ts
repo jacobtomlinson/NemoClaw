@@ -6,6 +6,7 @@ import type { OpenClawPluginApi } from "./index.js";
 
 vi.mock("node:child_process", () => ({
   execFileSync: vi.fn(),
+  execFile: vi.fn(),
 }));
 
 vi.mock("./onboard/config.js", () => ({
