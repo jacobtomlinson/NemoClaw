@@ -42,13 +42,21 @@ function blankState(): NemoClawState {
     hostBackupPath: null,
     createdAt: null,
     updatedAt: new Date().toISOString(),
+    lastRebuildAt: null,
+    lastRebuildBackupPath: null,
+    shieldsDown: false,
+    shieldsDownAt: null,
+    shieldsDownTimeout: null,
+    shieldsDownReason: null,
+    shieldsDownPolicy: null,
+    shieldsPolicySnapshotPath: null,
   };
 }
 
 // Unique session keys prevent cross-test cache hits (the Map is module-level).
 let sessionCounter = 0;
 function nextSessionKey(): string {
-  return `test-session-${++sessionCounter}`;
+  return `test-session-${String(++sessionCounter)}`;
 }
 
 // ---------------------------------------------------------------------------

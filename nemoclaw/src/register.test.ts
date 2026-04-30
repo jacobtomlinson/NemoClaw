@@ -292,7 +292,7 @@ describe("before_tool_call secret scanner hook (#1233)", () => {
     const api = createMockApi();
     const handler = getHookHandler(api);
     const fakeKey = "nvapi-" + "abcdefghijklmnopqrstuvwxyz";
-    handler({
+    void handler({
       toolName: "write",
       params: {
         file_path: "/sandbox/.openclaw/memory/creds.md",
