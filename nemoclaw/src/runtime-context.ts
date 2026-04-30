@@ -126,16 +126,19 @@ function normalizePolicyYaml(output: string | null): string | null {
  * access type, preferring explicit `access` field, then rule count, then protocol.
  */
 function describeEndpointAccess(endpoint: Record<string, unknown>): string {
-  if (typeof endpoint["access"] === "string" && (endpoint["access"] as string).trim().length > 0) {
-    return (endpoint["access"] as string).trim();
+  if (typeof endpoint["access"] === "string" && (endpoint["access"]).trim().length > 0) {
+    return (endpoint["access"]).trim();
   }
   const rules = Array.isArray(endpoint["rules"]) ? endpoint["rules"] : [];
   if (rules.length > 0) {
     const ruleCount = String(rules.length);
     return `${ruleCount} custom rule${rules.length === 1 ? "" : "s"}`;
   }
-  if (typeof endpoint["protocol"] === "string" && (endpoint["protocol"] as string).trim().length > 0) {
-    return (endpoint["protocol"] as string).trim();
+  if (
+    typeof endpoint["protocol"] === "string" &&
+    (endpoint["protocol"]).trim().length > 0
+  ) {
+    return (endpoint["protocol"]).trim();
   }
   return "explicit allow";
 }
@@ -159,13 +162,15 @@ function summarizeNetworkPolicies(policy: Record<string, unknown> | null): strin
     const name = (typeof e["name"] === "string" ? e["name"].trim() : null) || ruleId;
     const endpoints = Array.isArray(e["endpoints"]) ? e["endpoints"] : [];
     const endpoint = endpoints[0] as Record<string, unknown> | undefined;
-    const host = (typeof endpoint?.["host"] === "string" ? endpoint["host"].trim() : null) || "unknown-host";
+    const host =
+      (typeof endpoint?.["host"] === "string" ? endpoint["host"].trim() : null) || "unknown-host";
     const port = typeof endpoint?.["port"] === "number" ? endpoint["port"] : 0;
     const destination = port > 0 ? `${host}:${String(port)}` : host;
     const access = endpoint ? describeEndpointAccess(endpoint) : "explicit allow";
     const binaries = Array.isArray(e["binaries"]) ? e["binaries"] : [];
     const firstBinary = binaries[0] as Record<string, unknown> | undefined;
-    const binary = typeof firstBinary?.["path"] === "string" ? firstBinary["path"].trim() : undefined;
+    const binary =
+      typeof firstBinary?.["path"] === "string" ? firstBinary["path"].trim() : undefined;
     const binaryNote = binary ? ` via ${binary}` : "";
     return `${name}: ${destination} (${access})${binaryNote}`;
   });
@@ -236,7 +241,9 @@ async function loadPolicyDoc(sandboxName: string): Promise<Record<string, unknow
  *
  * @throws When the underlying `loadPolicyDoc` call fails.
  */
-async function getRuntimeSummaryFromFingerprint(fingerprint: RuntimeFingerprint): Promise<RuntimeSummary> {
+async function getRuntimeSummaryFromFingerprint(
+  fingerprint: RuntimeFingerprint,
+): Promise<RuntimeSummary> {
   const policyDoc = await loadPolicyDoc(fingerprint.sandboxName);
   return {
     sandboxName: fingerprint.sandboxName,
@@ -291,7 +298,10 @@ function serializeFingerprint(fingerprint: RuntimeFingerprint): string {
  * skipped entirely for this invocation so that different conversations without
  * session keys never share a cache entry.
  */
-function getSessionCacheKey(_pluginConfig: NemoClawConfig, hookContext: unknown): string | undefined {
+function getSessionCacheKey(
+  _pluginConfig: NemoClawConfig,
+  hookContext: unknown,
+): string | undefined {
   if (hookContext && typeof hookContext === "object") {
     const ctx = hookContext as Record<string, unknown>;
     const sessionKey = ctx["sessionKey"];
@@ -398,7 +408,10 @@ function buildRuntimeDeltaText(
  * @throws When `getRuntimeFingerprint` or `getRuntimeSummaryFromFingerprint`
  *   fails (i.e. openshell is unavailable for the policy get call).
  */
-async function getCachedRuntimeInjection(pluginConfig: NemoClawConfig, hookContext: unknown): Promise<string | null> {
+async function getCachedRuntimeInjection(
+  pluginConfig: NemoClawConfig,
+  hookContext: unknown,
+): Promise<string | null> {
   const fingerprint = await getRuntimeFingerprint(pluginConfig);
   const fingerprintKey = serializeFingerprint(fingerprint);
   const cacheKey = getSessionCacheKey(pluginConfig, hookContext);
@@ -412,7 +425,7 @@ async function getCachedRuntimeInjection(pluginConfig: NemoClawConfig, hookConte
   // Evict stale/excess entries before reading so we never return a stale hit.
   evictCache();
   const cached = sessionRuntimeCache.get(cacheKey);
-  if (cached && cached.fingerprintKey === fingerprintKey) {
+  if (cached?.fingerprintKey === fingerprintKey) {
     return null;
   }
   // May throw if openshell is unavailable for the full policy fetch; the caller
