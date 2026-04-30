@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { NemoClawState } from "../blueprint/state.js";
+import type { NemoClawState } from "./blueprint/state.js";
 import type { NemoClawConfig, OpenClawPluginApi } from "./index.js";
 
 // ---------------------------------------------------------------------------
@@ -152,7 +152,6 @@ function makeMockApi(): { api: MockApi; warnMessages: string[] } {
       debug: vi.fn(),
     },
     registerCommand: vi.fn(),
-    registerCli: vi.fn(),
     registerProvider: vi.fn(),
     registerService: vi.fn(),
     resolvePath: (s: string) => s,
@@ -217,6 +216,18 @@ describe("getRuntimeSummary", () => {
     });
     const summary = await getRuntimeSummary(defaultConfig);
     expect(summary.sandboxPhase).toBeNull();
+  });
+
+  it("falls back to configured sandbox name when state loading fails", async () => {
+    vi.mocked(loadState).mockImplementation(() => {
+      throw new Error("state read failure");
+    });
+
+    const summary = await getRuntimeSummary(defaultConfig);
+
+    expect(summary.sandboxName).toBe("openclaw");
+    expect(summary.sandboxPhase).toBeNull();
+    expect(summary.networkLines.some((line) => line.includes("deny-by-default"))).toBe(true);
   });
 
   it("produces deny-by-default network lines when no rules exist", async () => {
@@ -411,7 +422,7 @@ describe("registerRuntimeContext", () => {
       )) as {
         prependContext: string;
       };
-      expect(result.prependContext).toContain("do not claim unrestricted internet access");
+      expect(result.prependContext).toContain("Do not claim unrestricted host or internet access.");
     });
   });
 
@@ -472,6 +483,9 @@ describe("registerRuntimeContext", () => {
 
       const result = await api._trigger("before_agent_start", {}, key);
       expect(result).toHaveProperty("prependContext");
+      expect((result as { prependContext: string }).prependContext).toContain(
+        "<nemoclaw-runtime-update>",
+      );
     });
 
     it("update includes current network policy lines", async () => {
@@ -490,6 +504,7 @@ describe("registerRuntimeContext", () => {
       const result = (await api._trigger("before_agent_start", {}, key)) as {
         prependContext: string;
       };
+      expect(result.prependContext).toContain("<nemoclaw-runtime-update>");
       expect(result.prependContext).toContain("NVIDIA API");
     });
   });

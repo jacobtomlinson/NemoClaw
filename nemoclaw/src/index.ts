@@ -348,7 +348,13 @@ export default function register(api: OpenClawPluginApi): void {
 
   // 4. Register runtime context injection (sandbox-awareness hook)
   const pluginConfig = getPluginConfig(api);
-  registerRuntimeContext(api, pluginConfig);
+  try {
+    registerRuntimeContext(api, pluginConfig);
+  } catch (err) {
+    api.logger.warn(
+      `Could not register runtime context hook: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 
   let bannerEndpoint = onboardCfg ? describeOnboardEndpoint(onboardCfg) : "";
   let bannerProvider = onboardCfg ? describeOnboardProvider(onboardCfg) : "";

@@ -349,7 +349,7 @@ function buildRuntimeContextText(summary: RuntimeSummary): string {
     "Filesystem policy:",
     ...summary.filesystemLines.map((line) => `- ${line}`),
     "Behavior:",
-    "- do not claim unrestricted internet access",
+    "- Do not claim unrestricted host or internet access.",
     "- if access is blocked, say it is blocked and ask the operator to adjust policy or approve it in OpenShell",
     "</nemoclaw-runtime>",
   ].filter((line): line is string => Boolean(line));
@@ -448,8 +448,14 @@ export async function getRuntimeSummary(pluginConfig: NemoClawConfig): Promise<R
     const fingerprint = await getRuntimeFingerprint(pluginConfig);
     return await getRuntimeSummaryFromFingerprint(fingerprint);
   } catch {
+    let sandboxName = pluginConfig.sandboxName;
+    try {
+      sandboxName = getSandboxName(pluginConfig);
+    } catch {
+      // Keep the configured default if persisted state cannot be read.
+    }
     return {
-      sandboxName: getSandboxName(pluginConfig),
+      sandboxName,
       sandboxPhase: null,
       networkLines: summarizeNetworkPolicies(null),
       filesystemLines: summarizeFilesystem(null),

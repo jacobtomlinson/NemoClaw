@@ -62,6 +62,22 @@ describe("plugin registration", () => {
     expect(api.registerProvider).toHaveBeenCalledWith(expect.objectContaining({ id: "inference" }));
   });
 
+  it("continues registration when the runtime context hook is unsupported", () => {
+    const api = createMockApi();
+    vi.mocked(api.on).mockImplementation((hookName: string) => {
+      if (hookName === "before_agent_start") {
+        throw new Error("unsupported hook");
+      }
+    });
+
+    register(api);
+
+    expect(api.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("Could not register runtime context hook: unsupported hook"),
+    );
+    expect(api.registerProvider).toHaveBeenCalledWith(expect.objectContaining({ id: "inference" }));
+  });
+
   it("does NOT register CLI commands", () => {
     const api = createMockApi();
     // registerCli should not exist on the API interface after removal
