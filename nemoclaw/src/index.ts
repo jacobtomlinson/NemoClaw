@@ -200,7 +200,9 @@ export interface OpenClawPluginApi {
   resolvePath: (input: string) => string;
   on: (
     hookName: string,
-    handler: (...args: readonly PluginValue[]) => BeforeToolCallResult | undefined,
+    handler: (
+      ...args: readonly PluginValue[]
+    ) => BeforeToolCallResult | undefined | Promise<BeforeToolCallResult | undefined>,
   ) => void;
 }
 
