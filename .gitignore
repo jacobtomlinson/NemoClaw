@@ -1,5 +1,7 @@
 # Build artifacts and caches
+.version
 *.pyc
+*.tsbuildinfo
 .pytest_cache/
 __pycache__/
 coverage/
@@ -13,8 +15,10 @@ desktop.ini
 Thumbs.db
 
 # Project-specific
-.claude/
+.nemoclaw-maintainer/
 draft_newsletter_*
+research/
+specs/
 vdr-notes/
 
 # Security: secrets, credentials, and keys

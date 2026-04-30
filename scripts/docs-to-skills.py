@@ -11,7 +11,7 @@ Usage:
 Make sure to run this script using the following command to generate the skills and keep the locations and names consistent.
 
 ```bash
-python scripts/docs-to-skills.py docs/ .agents/skills/docs/ --prefix nemoclaw
+python3 scripts/docs-to-skills.py docs/ .agents/skills/ --prefix nemoclaw-user
 ```
 
 What it does:
@@ -19,37 +19,45 @@ What it does:
   2. Classifies each page by content type (how_to, concept, reference,
      get_started) using the frontmatter `content.type` field.
   3. Groups pages into skills using one of three strategies:
-       - smart (default): groups by directory, merges concept pages as
-         context for procedure pages in the same directory.
+       - smart (default): groups by directory; one primary procedure page
+         becomes the main SKILL.md body, while sibling procedure, concept,
+         and reference pages ride along as reference files.
        - grouped: groups all pages in the same parent directory.
        - individual: each doc page becomes its own skill.
   4. Generates a skill directory per group containing:
-       - SKILL.md with frontmatter (name, description, trigger keywords),
-         procedural steps, context sections, and a Related Skills section.
-       - references/ with detailed concept and reference content for
-         progressive disclosure (loaded by the agent on demand).
+       - SKILL.md with frontmatter (name, description), prerequisites,
+         procedural steps for the primary procedure page, a References
+         section that links to sibling pages, and a Related Skills section.
+         Sibling procedure, concept, and reference bodies are not inlined,
+         so SKILL.md stays small and nothing is truncated mid-table or
+         mid-code-fence.
+       - references/ with the full sibling procedure, concept, and reference
+         content for progressive disclosure (loaded by the agent on demand).
   5. Resolves all relative doc paths to repo-root-relative paths, and
      converts cross-references between docs into skill-to-skill pointers
      so agents can navigate between skills.
 
 Naming:
   Use --prefix to keep skill names consistent across the project. The prefix
-  is prepended to every generated skill name (e.g. --prefix nemoclaw produces
-  nemoclaw-get-started, nemoclaw-manage-policy). Action verbs are derived
+  is prepended to every generated skill name (e.g. --prefix nemoclaw-user produces
+  nemoclaw-user-get-started, nemoclaw-user-manage-policy). Action verbs are derived
   automatically from page titles and content types. Use --name-map to
   override specific names when the heuristic doesn't produce the right result.
 
 Usage:
-    python scripts/docs-to-skills.py docs/ .agents/skills/ --prefix nemoclaw
-    python scripts/docs-to-skills.py docs/ output/ --prefix nemoclaw --dry-run
-    python scripts/docs-to-skills.py docs/ output/ --strategy individual --prefix nemoclaw
-    python scripts/docs-to-skills.py docs/ output/ --prefix nemoclaw --name-map about=overview
-    python scripts/docs-to-skills.py docs/ output/ --exclude "release-notes.md"
+    python3 scripts/docs-to-skills.py docs/ .agents/skills/ --prefix nemoclaw-user
+    python3 scripts/docs-to-skills.py docs/ .agents/skills/ --prefix nemoclaw-user --dry-run
+    python3 scripts/docs-to-skills.py docs/ .agents/skills/ --strategy individual --prefix nemoclaw-user
+    python3 scripts/docs-to-skills.py docs/ .agents/skills/ --prefix nemoclaw-user --name-map about=overview
+    python3 scripts/docs-to-skills.py docs/ .agents/skills/ --prefix nemoclaw-user --exclude "release-notes.md"
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
+import json
+import os
 import re
 import sys
 import textwrap
@@ -57,9 +65,87 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def load_html_baseurl(docs_dir: Path) -> str | None:
+    """Read ``html_baseurl`` from a Sphinx ``conf.py`` without executing it.
+
+    Skill files must be self-contained and must not reference repository
+    paths (for example, ``../../../docs/...``). When an inter-doc link
+    points at a page that has no corresponding skill, the rewriter
+    substitutes the page's published HTTPS URL derived from
+    ``html_baseurl``. Parsing the assignment with :mod:`ast` avoids the
+    side effects of ``exec``-ing conf.py (which pulls in Sphinx, modifies
+    ``sys.path``, reads JSON, and so on).
+    """
+    conf_py = docs_dir / "conf.py"
+    if not conf_py.exists():
+        return None
+    try:
+        tree = ast.parse(conf_py.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):
+        return None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if (
+            isinstance(target, ast.Name)
+            and target.id == "html_baseurl"
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            url = node.value.value
+            return url if url.endswith("/") else url + "/"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Heading normalization
+# ---------------------------------------------------------------------------
+
+
+def normalize_heading_levels(text: str) -> str:
+    """Ensure markdown headings increment by at most one level at a time.
+
+    After resolving includes the document may contain heading-level gaps
+    (e.g. ``# Title`` followed by ``### Sub`` with no intervening ``##``).
+    This function promotes headings so the nesting never skips a level,
+    preserving the relative depth of sibling and child headings.
+    """
+    lines = text.split("\n")
+    heading_re = re.compile(r"^(#{1,6})\s")
+    # First pass: collect all heading levels in order.
+    heading_levels: list[tuple[int, int]] = []  # (line_index, level)
+    for i, line in enumerate(lines):
+        m = heading_re.match(line)
+        if m:
+            heading_levels.append((i, len(m.group(1))))
+
+    if not heading_levels:
+        return text
+
+    # Second pass: compute the minimum level each heading should have
+    # so that no heading exceeds its predecessor by more than 1.
+    max_allowed = 0
+    remap: dict[int, int] = {}  # line_index -> new_level
+    for idx, level in heading_levels:
+        new_level = min(level, max_allowed + 1)
+        remap[idx] = new_level
+        max_allowed = new_level
+
+    # Third pass: rewrite headings.
+    for idx, new_level in remap.items():
+        m = heading_re.match(lines[idx])
+        if m:
+            old_prefix = m.group(1)
+            lines[idx] = "#" * new_level + lines[idx][len(old_prefix) :]
+
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Frontmatter / doc parsing
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class DocPage:
@@ -73,6 +159,7 @@ class DocPage:
     # Derived fields populated after parsing
     title: str = ""
     description: str = ""
+    description_is_agent: bool = False
     content_type: str = ""  # concept, how_to, reference, get_started, tutorial
     difficulty: str = ""
     keywords: list[str] = field(default_factory=list)
@@ -96,7 +183,7 @@ def parse_yaml_frontmatter(text: str) -> tuple[dict, str]:
         return {}, text
 
     fm_text = text[4:end].strip()
-    body = text[end + 4:].strip()
+    body = text[end + 4 :].strip()
     fm = _parse_simple_yaml(fm_text)
     return fm, body
 
@@ -105,7 +192,6 @@ def _parse_simple_yaml(text: str) -> dict:
     """Minimal YAML parser for doc frontmatter. Handles nested keys, lists."""
     result: dict = {}
     current_key: str | None = None
-    current_indent = 0
     parent_stack: list[tuple[str, dict, int]] = []
 
     for line in text.split("\n"):
@@ -138,8 +224,11 @@ def _parse_simple_yaml(text: str) -> dict:
             target = _current_dict(result, parent_stack)
 
             if val.startswith("[") and val.endswith("]"):
-                items = [v.strip().strip('"').strip("'")
-                         for v in val[1:-1].split(",") if v.strip()]
+                items = [
+                    v.strip().strip('"').strip("'")
+                    for v in val[1:-1].split(",")
+                    if v.strip()
+                ]
                 target[key] = items
                 current_key = key
             elif val:
@@ -149,8 +238,6 @@ def _parse_simple_yaml(text: str) -> dict:
                 target[key] = {}
                 parent_stack.append((key, target, indent))
                 current_key = None
-
-            current_indent = indent
 
     return result
 
@@ -177,7 +264,17 @@ def parse_doc(path: Path) -> DocPage:
     elif isinstance(title_block, str):
         page.title = title_block
 
-    page.description = fm.get("description", "")
+    desc = fm.get("description", "")
+    if isinstance(desc, dict):
+        main = str(desc.get("main") or "").strip()
+        agent = str(desc.get("agent") or "").strip()
+        if agent:
+            page.description = agent
+            page.description_is_agent = True
+        else:
+            page.description = main
+    else:
+        page.description = str(desc or "").strip()
     page.keywords = fm.get("keywords", [])
     page.tags = fm.get("tags", [])
 
@@ -218,6 +315,7 @@ def _extract_sections(body: str) -> list[tuple[str, str]]:
 # Content transformation
 # ---------------------------------------------------------------------------
 
+
 def clean_myst_directives(text: str) -> str:
     """Convert MyST/Sphinx directives to standard markdown equivalents."""
     # Multi-line {include} directives with :start-after: etc.
@@ -250,8 +348,11 @@ def clean_myst_directives(text: str) -> str:
 
     def _format_admonition(title: str, body: str) -> str:
         """Format an admonition as a blockquote, stripping directive lines."""
-        lines = [l for l in body.strip().split("\n")
-                 if not re.match(r"^\s*:[a-z_-]+:", l)]
+        lines = [
+            line
+            for line in body.strip().split("\n")
+            if not re.match(r"^\s*:[a-z_-]+:", line)
+        ]
         while lines and not lines[0].strip():
             lines.pop(0)
         while lines and not lines[-1].strip():
@@ -315,9 +416,7 @@ def resolve_includes(text: str, source_dir: Path) -> str:
     Handles :start-after: and :end-before: markers for partial content
     extraction. Falls back to a placeholder when the file cannot be read.
     """
-    pattern = re.compile(
-        r"```\{include\}\s*([^\n]+)\n((?::[^\n]+\n)*)```"
-    )
+    pattern = re.compile(r"```\{include\}\s*([^\n]+)\n((?::[^\n]+\n)*)```")
 
     def _resolve(match: re.Match) -> str:
         raw_path = match.group(1).strip()
@@ -328,9 +427,9 @@ def resolve_includes(text: str, source_dir: Path) -> str:
         for line in directives.strip().split("\n"):
             line = line.strip()
             if line.startswith(":start-after:"):
-                start_after = line[len(":start-after:"):].strip()
+                start_after = line[len(":start-after:") :].strip()
             elif line.startswith(":end-before:"):
-                end_before = line[len(":end-before:"):].strip()
+                end_before = line[len(":end-before:") :].strip()
 
         resolved = (source_dir / raw_path).resolve()
         if not resolved.is_file():
@@ -344,7 +443,7 @@ def resolve_includes(text: str, source_dir: Path) -> str:
         if start_after:
             idx = content.find(start_after)
             if idx != -1:
-                content = content[idx + len(start_after):]
+                content = content[idx + len(start_after) :]
         if end_before:
             idx = content.find(end_before)
             if idx != -1:
@@ -369,15 +468,42 @@ def rewrite_doc_paths(
     source_page: DocPage,
     docs_dir: Path,
     doc_to_skill: dict[str, str],
+    html_baseurl: str | None = None,
 ) -> str:
-    """Resolve relative doc paths to repo-root paths or skill cross-references.
+    """Resolve relative doc paths to skill cross-refs or published URLs.
 
-    Handles:
-    - Markdown links: [text](../path.md) → [text](docs/path.md) or skill ref
-    - Include placeholders: "included from ../../README.md" → repo-root path
+    Skill files are meant to be self-contained, so the rewriter never
+    emits filesystem paths back into ``docs/`` (or anywhere else in the
+    repo). Rewrite precedence for each Markdown link ``[text](path)``:
+
+    1. If the target is an external URL, an anchor, or a ``mailto:``
+       reference, or the target is not a ``.md`` / ``.html`` file, leave
+       it untouched.
+    2. If the target resolves to a doc that has a generated skill,
+       replace the whole link with ``text (use the `<skill>` skill)``.
+    3. If the target is a page inside ``docs/``, emit
+       ``[text](<html_baseurl><page>.html)`` using the base URL read
+       from ``conf.py``.
+    4. Otherwise (target outside ``docs/``, or no base URL available),
+       strip the hyperlink and keep the link text. Self-containment wins
+       over navigability in the fallback.
+
+    Include placeholders that referenced ``docs/``-relative paths are
+    rewritten the same way: published URL if available, else dropped.
     """
     repo_root = docs_dir.parent
     source_dir = source_page.path.parent
+
+    def _to_html_url(resolved: Path, frag: str) -> str | None:
+        """Published URL for a doc under ``docs/``; ``None`` otherwise."""
+        if not html_baseurl:
+            return None
+        try:
+            rel_to_docs = resolved.relative_to(docs_dir)
+        except ValueError:
+            return None
+        html_path = rel_to_docs.with_suffix(".html").as_posix()
+        return f"{html_baseurl}{html_path}{frag}"
 
     def _resolve_link(match: re.Match) -> str:
         link_text = match.group(1)
@@ -387,12 +513,20 @@ def rewrite_doc_paths(
         if raw_path.startswith(("http://", "https://", "#", "mailto:")):
             return match.group(0)
 
+        # Preserve fragment anchors across the rewrite
+        if "#" in raw_path:
+            path_no_frag, _, frag = raw_path.partition("#")
+            frag = "#" + frag
+        else:
+            path_no_frag = raw_path
+            frag = ""
+
         # Skip non-doc files
-        if not raw_path.endswith(".md") and not raw_path.endswith(".html"):
+        if not path_no_frag.endswith(".md") and not path_no_frag.endswith(".html"):
             return match.group(0)
 
         # Resolve relative path against the source doc's directory
-        resolved = (source_dir / raw_path).resolve()
+        resolved = (source_dir / path_no_frag).resolve()
         try:
             rel_to_repo = resolved.relative_to(repo_root)
         except ValueError:
@@ -402,10 +536,13 @@ def rewrite_doc_paths(
         rel_str = str(rel_to_repo)
         if rel_str in doc_to_skill:
             skill_name = doc_to_skill[rel_str]
-            return f"{link_text} (see the `{skill_name}` skill)"
+            return f"{link_text} (use the `{skill_name}` skill)"
 
-        # Fall back to repo-root-relative path
-        return f"[{link_text}]({rel_to_repo})"
+        # Self-contained fallback: published URL or strip the hyperlink.
+        url = _to_html_url(resolved, frag)
+        if url is not None:
+            return f"[{link_text}]({url})"
+        return link_text
 
     # Rewrite markdown links: [text](path)
     text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _resolve_link, text)
@@ -414,11 +551,12 @@ def rewrite_doc_paths(
     def _resolve_include(match: re.Match) -> str:
         raw_path = match.group(1).strip()
         resolved = (source_dir / raw_path).resolve()
-        try:
-            rel_to_repo = resolved.relative_to(repo_root)
-        except ValueError:
-            return match.group(0)
-        return f"> *Content included from `{rel_to_repo}` — see the original doc for full text.*"
+        url = _to_html_url(resolved, "")
+        if url is not None:
+            return f"> *Content included from [{raw_path}]({url}) — see the original doc for full text.*"
+        # No base URL available; drop the breadcrumb so the skill stays
+        # self-contained. The included content itself is already inlined.
+        return ""
 
     text = re.sub(
         r"> \*Content included from ([^\n]+) — see the original doc for full text\.\*",
@@ -441,8 +579,8 @@ def extract_related_skills(text: str) -> tuple[str, list[str]]:
     # Match H2 or H3 "Next Steps" / "Related Topics" sections and their content
     pattern = re.compile(
         r"^(#{2,3})\s+(Next Steps|Related Topics)\s*\n+"
-        r"(?:.*?\n)*?"       # optional intro line
-        r"((?:- .+\n?)+)",   # the bullet list
+        r"(?:.*?\n)*?"  # optional intro line
+        r"((?:- .+\n?)+)",  # the bullet list
         re.MULTILINE,
     )
 
@@ -475,11 +613,95 @@ def extract_related_skills(text: str) -> tuple[str, list[str]]:
     return cleaned, entries
 
 
+def _split_description_trigger(desc: str) -> tuple[str, str]:
+    """Split a page description into (covers, trigger) halves.
+
+    Doc frontmatter tends to phrase ``description.agent`` as
+    ``"<what it covers>. Use when <trigger>."`` (or ``"Use for ..."``).
+    Splitting on that marker lets the References section lead each
+    bullet with the *when* so the agent sees the activation trigger
+    before the descriptive text — the pattern the skill-creation
+    best-practices guide recommends for progressive disclosure.
+
+    Returns ``(covers, trigger)`` where ``trigger`` starts with
+    ``"when "`` or ``"for "`` (no leading ``"Use "``), or an empty
+    string when no marker is found. Trailing periods are stripped from
+    both halves so callers can add punctuation as needed.
+    """
+    text = (desc or "").strip()
+    if not text:
+        return "", ""
+
+    lowest_idx = -1
+    for marker in (". Use when ", ". Use for "):
+        idx = text.find(marker)
+        if idx != -1 and (lowest_idx == -1 or idx < lowest_idx):
+            lowest_idx = idx
+    if lowest_idx == -1:
+        return text.rstrip("."), ""
+
+    covers = text[:lowest_idx].strip().rstrip(".")
+    # Len of ". Use " is 6; keep the "when ..." / "for ..." tail.
+    trigger = text[lowest_idx + 6 :].strip().rstrip(".")
+    return covers, trigger
+
+
+_WARNING_BLOCK_RE = re.compile(
+    r":::\{warning\}(?:[ \t]+([^\n]+))?\n(.*?)\n:::",
+    re.DOTALL,
+)
+
+
+def _extract_gotchas(pages: list[DocPage]) -> list[str]:
+    """Pull ``:::{warning}`` admonitions out of the source pages.
+
+    Returns a list of markdown bullets suitable for a top-level
+    ``## Gotchas`` section. The admonition stays in place inline, but
+    surfacing its first sentence up front means the agent sees the
+    correction before it picks a path through the steps — per the
+    best-practices guide, gotchas are highest-value when they live
+    above the procedures they correct.
+
+    Uses the admonition's inline title when present; otherwise leads
+    with the first sentence of the body. Deduplicates across pages so
+    repeated warnings collapse to one bullet.
+    """
+    bullets: list[str] = []
+    seen: set[str] = set()
+    for page in pages:
+        for m in _WARNING_BLOCK_RE.finditer(page.body):
+            title = (m.group(1) or "").strip().rstrip(".!?")
+            body = m.group(2).strip()
+            # Strip any directive metadata lines such as ``:class: ...``
+            body_lines = [
+                ln
+                for ln in body.split("\n")
+                if not re.match(r"^\s*:[a-z_-]+:", ln)
+            ]
+            body = "\n".join(body_lines).strip()
+            if not body:
+                continue
+            first = re.split(r"(?<=[.!?])\s+", body, maxsplit=1)[0].strip()
+            # Collapse intra-sentence whitespace — source docs wrap at ~80
+            # chars, so without this the bullet breaks across lines.
+            first = re.sub(r"\s+", " ", first)
+            if title:
+                bullet = f"- **{title}.** {first}"
+            else:
+                bullet = f"- {first}"
+            key = bullet.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            bullets.append(bullet)
+    return bullets
+
+
 def _safe_truncation_point(lines: list[str], target: int) -> int:
     """Find a safe truncation point that doesn't break code fences."""
     in_fence = False
     last_safe = target
-    for i, line in enumerate(lines[:target + 20]):
+    for i, line in enumerate(lines[: target + 20]):
         if line.strip().startswith("```"):
             in_fence = not in_fence
         if i >= target and not in_fence:
@@ -491,30 +713,6 @@ def _safe_truncation_point(lines: list[str], target: int) -> int:
             if lines[i].strip().startswith("```"):
                 return i + 1
     return last_safe
-
-
-def extract_trigger_keywords(pages: list[DocPage]) -> list[str]:
-    """Build trigger keywords from doc metadata across a group of pages."""
-    keywords: set[str] = set()
-
-    for page in pages:
-        keywords.update(page.keywords)
-        for tag in page.tags:
-            keywords.add(tag.replace("_", " "))
-
-        # Extract meaningful words from the title
-        if page.title:
-            title_words = re.sub(r"[^a-zA-Z\s]", "", page.title).lower().split()
-            stop_words = {"the", "a", "an", "and", "or", "for", "to", "in", "of",
-                          "it", "how", "what", "with", "from", "by", "on", "is"}
-            title_words = [w for w in title_words if w not in stop_words and len(w) > 2]
-            if len(title_words) >= 2:
-                keywords.add(" ".join(title_words[:4]))
-
-    # Remove duplicates of the skill name itself and generic terms
-    generic = {"generative_ai", "generative ai", "ai_agents", "ai agents", "published"}
-    keywords -= generic
-    return sorted(keywords)[:15]  # Cap at 15 keywords
 
 
 TITLE_VERBS = {
@@ -575,14 +773,56 @@ CATEGORY_NOUNS = {
     "security": "security",
 }
 
-NOUN_STOP = {"the", "a", "an", "and", "or", "for", "to", "in", "of", "it",
-             "how", "what", "with", "from", "by", "on", "is", "your", "that",
-             "this", "its", "use", "using", "at", "runtime", "activity",
-             "issues", "guide", "configuration", "settings", "options",
-             "models", "providers", "requests", "resources", "instances",
-             "debug", "troubleshoot", "fix", "check", "verify", "test",
-             "deny", "approve", "enable", "disable", "manage", "works",
-             "agent", "agents"}
+NOUN_STOP = {
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "for",
+    "to",
+    "in",
+    "of",
+    "it",
+    "how",
+    "what",
+    "with",
+    "from",
+    "by",
+    "on",
+    "is",
+    "your",
+    "that",
+    "this",
+    "its",
+    "use",
+    "using",
+    "at",
+    "runtime",
+    "activity",
+    "issues",
+    "guide",
+    "configuration",
+    "settings",
+    "options",
+    "models",
+    "providers",
+    "requests",
+    "resources",
+    "instances",
+    "debug",
+    "troubleshoot",
+    "fix",
+    "check",
+    "verify",
+    "test",
+    "deny",
+    "approve",
+    "enable",
+    "disable",
+    "manage",
+    "works",
+}
 
 PROJECT_STOP = set()  # Populated at runtime from --prefix
 
@@ -603,14 +843,16 @@ def _extract_noun_from_title(title: str) -> str | None:
     # Strip the leading verb phrase
     for phrase in sorted(TITLE_VERBS, key=lambda x: -len(x)):
         if lower.startswith(phrase):
-            lower = lower[len(phrase):].strip()
+            lower = lower[len(phrase) :].strip()
             break
 
     # Strip everything after em-dash, en-dash, or colon (subtitle)
     lower = re.split(r"\s*[—–]\s*|\s*:\s*|\s*-{2,}\s*", lower)[0]
 
     words = re.sub(r"[^a-z\s]", "", lower).split()
-    nouns = [w for w in words if w not in NOUN_STOP and w not in PROJECT_STOP and len(w) > 2]
+    nouns = [
+        w for w in words if w not in NOUN_STOP and w not in PROJECT_STOP and len(w) > 2
+    ]
 
     if len(nouns) >= 2:
         return "-".join(nouns[:2])
@@ -681,37 +923,88 @@ def generate_skill_name(
     return name
 
 
-def build_skill_description(name: str, pages: list[DocPage], keywords: list[str]) -> str:
+BRAND_WORDS: dict[str, str] = {
+    "nemoclaw": "NemoClaw",
+    "openclaw": "OpenClaw",
+    "openshell": "OpenShell",
+    "nvidia": "NVIDIA",
+    "gpu": "GPU",
+    "cli": "CLI",
+    "tui": "TUI",
+    "api": "API",
+    "llm": "LLM",
+    "llms": "LLMs",
+}
+
+
+def _brand_case(text: str) -> str:
+    """Replace generic title-cased words with their brand-correct forms."""
+    for wrong, right in BRAND_WORDS.items():
+        text = re.sub(rf"\b{re.escape(wrong)}\b", right, text, flags=re.IGNORECASE)
+    return text
+
+
+def build_skill_description(name: str, pages: list[DocPage]) -> str:
     """Build the description field for the skill frontmatter.
 
-    Best-practices compliance:
-    - Uses third-person voice (e.g. "Installs..." not "Install...")
-    - Includes "Use when..." clause instead of flat "Trigger keywords -" list
-    - Keeps description under 1024 characters
+    Uses the lead page's ``description.agent`` (or third-person-normalized
+    legacy ``description``) verbatim, then merges every page's frontmatter
+    ``keywords`` list into a single ``Trigger keywords - ...`` clause so
+    the host surfaces the skill on matching user queries. The ``## References``
+    section inside SKILL.md already lists every reference file the skill
+    ships, so that information is not duplicated in the description.
+
+    Keeps description under 1024 characters.
     """
-    descriptions = [p.description for p in pages if p.description]
-    if descriptions:
-        combined = _to_third_person(descriptions[0]).rstrip(".")
-        if len(descriptions) > 1:
-            extras = []
-            for d in descriptions[1:3]:
-                clean = _to_third_person(d).rstrip(".")
-                if clean:
-                    clean = clean[0].lower() + clean[1:]
-                extras.append(clean)
-            combined += ". Also covers " + "; ".join(extras) + "."
-        else:
-            combined += "."
+    if not pages:
+        return f"Documentation-derived skill for {name.replace('-', ' ')}."
+
+    lead = pages[0]
+    if lead.description:
+        lead_desc = (
+            lead.description
+            if lead.description_is_agent
+            else _to_third_person(lead.description)
+        )
+        lead_desc = lead_desc.rstrip().rstrip(".") + "."
     else:
-        combined = f"Documentation-derived skill for {name.replace('-', ' ')}."
+        lead_desc = f"Documentation-derived skill for {name.replace('-', ' ')}."
 
-    kw_list = keywords[:8]
-    if kw_list:
-        combined += " Use when " + ", ".join(kw_list) + "."
+    # Merge keywords from every page, preserving lead-page order and
+    # deduplicating case-insensitively.
+    seen_keywords: set[str] = set()
+    merged_keywords: list[str] = []
+    for page in pages:
+        for kw in page.keywords or []:
+            kw_clean = str(kw).strip()
+            if not kw_clean:
+                continue
+            key = kw_clean.lower()
+            if key in seen_keywords:
+                continue
+            seen_keywords.add(key)
+            merged_keywords.append(kw_clean)
+    if merged_keywords:
+        lead_desc += " Trigger keywords - " + ", ".join(merged_keywords) + "."
 
-    if len(combined) > 1024:
-        combined = combined[:1020] + "..."
-    return combined
+    if len(lead_desc) > 1024:
+        print(
+            f"  warning: description for skill '{name}' truncated from "
+            f"{len(lead_desc)} to 1023 characters; consider shortening the "
+            f"lead page's description.agent or removing redundant keywords",
+            file=sys.stderr,
+        )
+        lead_desc = lead_desc[:1020] + "..."
+    return lead_desc
+
+
+def yaml_scalar(value: str) -> str:
+    """Return a YAML-safe quoted scalar using JSON string escaping.
+
+    JSON strings are valid YAML 1.2 double-quoted scalars, which makes this a
+    lightweight way to safely emit frontmatter without adding a YAML library.
+    """
+    return json.dumps(value, ensure_ascii=False)
 
 
 def _to_third_person(sentence: str) -> str:
@@ -736,8 +1029,18 @@ def _to_third_person(sentence: str) -> str:
         return sentence
 
     _BASE_VERBS_ENDING_IN_S = {
-        "access", "process", "address", "discuss", "bypass", "express",
-        "compress", "assess", "stress", "progress", "focus", "canvas",
+        "access",
+        "process",
+        "address",
+        "discuss",
+        "bypass",
+        "express",
+        "compress",
+        "assess",
+        "stress",
+        "progress",
+        "focus",
+        "canvas",
     }
     if first_word.endswith("ing"):
         return first_word + trailing_punct + suffix
@@ -745,7 +1048,11 @@ def _to_third_person(sentence: str) -> str:
         return first_word + trailing_punct + suffix
     if first_word.endswith(("ch", "sh", "x", "ss", "zz")):
         return first_word + "es" + trailing_punct + suffix
-    if first_word.endswith("y") and len(first_word) > 1 and first_word[-2] not in "aeiou":
+    if (
+        first_word.endswith("y")
+        and len(first_word) > 1
+        and first_word[-2] not in "aeiou"
+    ):
         return first_word[:-1] + "ies" + trailing_punct + suffix
     return first_word + "s" + trailing_punct + suffix
 
@@ -763,77 +1070,125 @@ CONTENT_TYPE_ROLE = {
 }
 
 
+def markdown_spdx_header() -> str:
+    """Return the SPDX header for generated Markdown files."""
+    return "\n".join(
+        [
+            "<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->",
+            "<!-- SPDX-License-Identifier: Apache-2.0 -->",
+            "",
+        ]
+    )
+
+
+def partition_skill_pages(
+    pages: list[DocPage],
+) -> tuple[list[DocPage], list[DocPage], list[DocPage], list[DocPage]]:
+    """Split a doc group into inline procedures and deferred references.
+
+    The converter preserves the existing one-skill-per-docs-area grouping, but
+    keeps SKILL.md focused by inlining only one primary procedure. Additional
+    how-to/tutorial pages still contribute triggers through the skill
+    description and are written to references/ for progressive disclosure.
+    """
+    procedures = [
+        p for p in pages if CONTENT_TYPE_ROLE.get(p.content_type) == "procedure"
+    ]
+    # Pages without a recognized content_type default to procedure.
+    procedures.extend([p for p in pages if p.content_type not in CONTENT_TYPE_ROLE])
+
+    context_pages = [
+        p for p in pages if CONTENT_TYPE_ROLE.get(p.content_type) == "context"
+    ]
+    reference_pages = [
+        p for p in pages if CONTENT_TYPE_ROLE.get(p.content_type) == "reference"
+    ]
+
+    if not procedures:
+        return [], [], context_pages, reference_pages
+
+    primary = [procedures[0]]
+    deferred = procedures[1:]
+    return primary, deferred, context_pages, reference_pages
+
+
 def generate_skill(
     name: str,
     pages: list[DocPage],
-    output_dir: Path,
+    output_dirs: list[Path],
     *,
     docs_dir: Path | None = None,
     doc_to_skill: dict[str, str] | None = None,
+    html_baseurl: str | None = None,
     dry_run: bool = False,
 ) -> dict:
     """Generate a complete skill directory from a group of doc pages.
 
+    Writes identical output to each directory in *output_dirs*. Since
+    inter-doc links are rewritten to either skill cross-references or
+    absolute HTTPS URLs (see :func:`rewrite_doc_paths`), the emitted
+    content is independent of where it is written and can safely be
+    mirrored across multiple output roots.
+
     Returns a summary dict for reporting.
     """
-    keywords = extract_trigger_keywords(pages)
-    description = build_skill_description(name, pages, keywords)
-
     def _clean(text: str, source: DocPage) -> str:
         """Apply directive cleanup and path rewriting for a source page."""
         result = clean_myst_directives(text)
         if docs_dir and doc_to_skill is not None:
-            result = rewrite_doc_paths(result, source, docs_dir, doc_to_skill)
+            result = rewrite_doc_paths(
+                result,
+                source,
+                docs_dir,
+                doc_to_skill,
+                html_baseurl=html_baseurl,
+            )
         return result
 
-    procedures = [p for p in pages if CONTENT_TYPE_ROLE.get(p.content_type) == "procedure"]
-    context_pages = [p for p in pages if CONTENT_TYPE_ROLE.get(p.content_type) == "context"]
-    reference_pages = [p for p in pages if CONTENT_TYPE_ROLE.get(p.content_type) == "reference"]
-
-    # Pages without a recognized content_type default to procedure
-    untyped = [p for p in pages if p.content_type not in CONTENT_TYPE_ROLE]
-    procedures.extend(untyped)
+    procedures, deferred_procedures, context_pages, reference_pages = (
+        partition_skill_pages(pages)
+    )
+    description_pages = (
+        procedures + deferred_procedures + context_pages + reference_pages
+        if procedures
+        else pages
+    )
+    description = build_skill_description(name, description_pages)
 
     # Build SKILL.md content
     lines: list[str] = []
 
     # Frontmatter
     lines.append("---")
-    lines.append(f"name: {name}")
-    lines.append(f"description: {description}")
+    lines.append(f"name: {yaml_scalar(name)}")
+    lines.append(f"description: {yaml_scalar(description)}")
     lines.append("---")
     lines.append("")
+    lines.append(markdown_spdx_header().rstrip("\n"))
+    lines.append("")
 
-    # Title
-    skill_title = name.replace("-", " ").title()
+    # Title — prefer the lead page's frontmatter `title.page` (or H1)
+    # verbatim so the SKILL.md heading matches the source doc instead of
+    # echoing the auto-generated, prefix-laden skill name.
+    lead_page = procedures[0] if procedures else pages[0] if pages else None
+    if lead_page and lead_page.title:
+        skill_title = lead_page.title
+    else:
+        skill_title = _brand_case(name.replace("-", " ").title())
     lines.append(f"# {skill_title}")
     lines.append("")
 
-    # Summary from the first page's description
-    if pages[0].description:
-        lines.append(pages[0].description)
+    # Gotchas — surface :::{warning} admonitions from the source procedure
+    # pages at the top so the agent sees non-obvious corrections before it
+    # commits to a path through the steps. The warnings stay in place
+    # inline; this section is a directed summary, not a replacement.
+    gotchas = _extract_gotchas(procedures)
+    if gotchas:
+        lines.append("## Gotchas")
         lines.append("")
-
-    # Context section from concept pages
-    if context_pages:
-        lines.append("## Context")
+        for g in gotchas:
+            lines.append(g)
         lines.append("")
-        for cp in context_pages:
-            body = _clean(cp.body, cp)
-            h1_match = re.match(r"^#\s+.+\n+", body)
-            if h1_match:
-                body = body[h1_match.end():]
-            # Trim to keep SKILL.md concise; full content goes to references/
-            body_lines = body.split("\n")
-            if len(body_lines) > 60:
-                cut = _safe_truncation_point(body_lines, 60)
-                trimmed = "\n".join(body_lines[:cut])
-                ref_name = cp.path.stem + ".md"
-                trimmed += f"\n\n> Full details in `references/{ref_name}`."
-                lines.append(trimmed)
-            else:
-                lines.append(body)
-            lines.append("")
 
     # Prerequisites (merged from all procedure pages, deduplicated)
     prereq_items: list[str] = []
@@ -845,6 +1200,8 @@ def generate_skill(
                 for item_line in cleaned.split("\n"):
                     stripped = item_line.strip()
                     if stripped.startswith("- "):
+                        if prereq_items and not prereq_items[-1].startswith("- "):
+                            prereq_items.append("")
                         norm = stripped.lower().strip("- .")
                         if norm not in seen_prereqs:
                             seen_prereqs.add(norm)
@@ -867,7 +1224,7 @@ def generate_skill(
     for idx, pp in enumerate(procedures):
         # When merging multiple docs, add a transition heading
         if len(procedures) > 1 and idx > 0 and pp.title:
-            lines.append(f"---")
+            lines.append("---")
             lines.append("")
 
         for heading, content in pp.sections:
@@ -890,16 +1247,6 @@ def generate_skill(
             lines.append("")
             lines.append(cleaned_content)
             lines.append("")
-
-    # Reference pages go to references/ but get a pointer in SKILL.md
-    if reference_pages:
-        lines.append("## Reference")
-        lines.append("")
-        for rp in reference_pages:
-            ref_name = rp.path.stem + ".md"
-            title = rp.title or rp.path.stem.replace("-", " ").title()
-            lines.append(f"- [{title}](references/{ref_name})")
-        lines.append("")
 
     # Build Related Skills from collected sections + any remaining in body
     raw_md = "\n".join(lines)
@@ -924,6 +1271,30 @@ def generate_skill(
             seen_skills.add(key)
             merged_entries.append(entry)
 
+    # References section — point at the full concept/reference files that
+    # ship alongside SKILL.md. Each bullet leads with the activation
+    # trigger from description.agent (the "Use when ..." clause) so the
+    # agent can decide on-sight whether to load the file, which is how
+    # progressive disclosure is supposed to work.
+    ref_section_pages = deferred_procedures + context_pages + reference_pages
+    if ref_section_pages:
+        lines.append("")
+        lines.append("## References")
+        lines.append("")
+        for rp in ref_section_pages:
+            ref_name = rp.path.stem + ".md"
+            file_link = f"[references/{ref_name}](references/{ref_name})"
+            covers, trigger = _split_description_trigger(rp.description or "")
+            if trigger:
+                bullet = f"- **Load {file_link}** {trigger}."
+                if covers:
+                    bullet += f" {covers}."
+            elif covers:
+                bullet = f"- **{file_link}** — {covers}."
+            else:
+                bullet = f"- {file_link}"
+            lines.append(bullet)
+
     if merged_entries:
         lines.append("")
         lines.append("## Related Skills")
@@ -932,20 +1303,19 @@ def generate_skill(
             lines.append(entry)
         lines.append("")
 
-    skill_md = "\n".join(lines)
+    skill_md = normalize_heading_levels("\n".join(lines))
 
     # --- Build reference files ---
     ref_files: dict[str, str] = {}
-    for rp in reference_pages + context_pages:
+    for rp in deferred_procedures + reference_pages + context_pages:
         ref_name = rp.path.stem + ".md"
-        body = _clean(rp.body, rp)
+        body = normalize_heading_levels(_clean(rp.body, rp))
         ref_files[ref_name] = body
 
     # --- Write output ---
-    skill_dir = output_dir / name
     summary = {
         "name": name,
-        "dir": str(skill_dir),
+        "dirs": [str(d / name) for d in output_dirs],
         "pages": [str(p.path) for p in pages],
         "skill_md_lines": len(skill_md.split("\n")),
         "reference_files": list(ref_files.keys()),
@@ -955,14 +1325,23 @@ def generate_skill(
         summary["dry_run"] = True
         return summary
 
-    skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
+    for output_dir in output_dirs:
+        skill_dir = output_dir / name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            skill_md.rstrip("\n") + "\n", encoding="utf-8"
+        )
 
-    if ref_files:
-        refs_dir = skill_dir / "references"
-        refs_dir.mkdir(exist_ok=True)
-        for fname, content in ref_files.items():
-            (refs_dir / fname).write_text(content, encoding="utf-8")
+        spdx_ref = markdown_spdx_header()
+
+
+        if ref_files:
+            refs_dir = skill_dir / "references"
+            refs_dir.mkdir(exist_ok=True)
+            for fname, content in ref_files.items():
+                (refs_dir / fname).write_text(
+                    spdx_ref + content.rstrip("\n") + "\n", encoding="utf-8"
+                )
 
     return summary
 
@@ -970,6 +1349,7 @@ def generate_skill(
 # ---------------------------------------------------------------------------
 # Grouping strategies
 # ---------------------------------------------------------------------------
+
 
 def group_by_directory(pages: list[DocPage]) -> dict[str, list[DocPage]]:
     """Group pages by their parent directory."""
@@ -986,12 +1366,12 @@ def group_individual(pages: list[DocPage]) -> dict[str, list[DocPage]]:
 
 
 def group_by_content_type(pages: list[DocPage]) -> dict[str, list[DocPage]]:
-    """Group pages by content type, merging concept+how_to for same topic."""
+    """Group pages by directory when an area has procedural content."""
     # First pass: group by directory
     dir_groups = group_by_directory(pages)
 
-    # Second pass: within each directory, merge concept pages as context
-    # for procedure pages in the same directory
+    # Second pass: keep each procedural docs area together. generate_skill()
+    # decides which page to inline and which sibling pages to defer.
     result: dict[str, list[DocPage]] = {}
     for cat, group_pages in dir_groups.items():
         has_procedures = any(
@@ -1019,17 +1399,32 @@ STRATEGIES = {
 # ---------------------------------------------------------------------------
 
 EXCLUDED_PATTERNS = {
-    "CONTRIBUTING.md", "README.md", "SETUP.md", "CHANGELOG.md",
-    "LICENSE.md", "license.md", "index.md",
+    "CONTRIBUTING.md",
+    "README.md",
+    "SETUP.md",
+    "CHANGELOG.md",
+    "LICENSE.md",
+    "license.md",
+    # Maintainer-only content consumed directly by skills/dashboards;
+    # not user-facing documentation.
+    "triage-instructions.md",
 }
 
 
 def scan_docs(docs_dir: Path) -> list[DocPage]:
     """Recursively scan a directory for documentation markdown files."""
     pages: list[DocPage] = []
+    docs_root_index = (docs_dir / "index.md").resolve()
     for md_path in sorted(docs_dir.rglob("*.md")):
         # Skip excluded files
         if md_path.name in EXCLUDED_PATTERNS:
+            continue
+        # Skip the top-level docs/index.md (Sphinx landing page — mostly
+        # boilerplate). Subdirectory index.md files (for example
+        # docs/get-started/platform-setup/index.md) are hub pages with
+        # real content and should be included so links to them can
+        # resolve to a generated skill instead of a file path.
+        if md_path.resolve() == docs_root_index:
             continue
         # Skip include fragments and templates
         if md_path.parent.name.startswith("_"):
@@ -1051,43 +1446,60 @@ def scan_docs(docs_dir: Path) -> list[DocPage]:
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Convert documentation files into Agent Skills.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Strategies:
-              grouped     Group docs by parent directory (default)
+              grouped     Group docs by parent directory
               individual  Each doc page becomes its own skill
-              smart       Group by directory, merge concept pages as context
+              smart       Group by directory, inline one procedure, defer siblings
 
             Examples:
-              %(prog)s docs/ .agents/skills/generated/ --prefix nemoclaw
-              %(prog)s docs/ output/ --strategy individual --prefix nemoclaw
-              %(prog)s docs/ output/ --prefix nemoclaw --name-map about=overview
-              %(prog)s docs/ output/ --strategy smart --dry-run
+              %(prog)s docs/ .agents/skills/ --prefix nemoclaw-user
+              %(prog)s docs/ .agents/skills/ --strategy individual --prefix nemoclaw-user
+              %(prog)s docs/ .agents/skills/ --prefix nemoclaw-user --name-map about=overview
+              %(prog)s docs/ .agents/skills/ --prefix nemoclaw-user --dry-run
         """),
     )
-    parser.add_argument("docs_dir", type=Path, help="Path to the documentation directory")
-    parser.add_argument("output_dir", type=Path, help="Output directory for generated skills")
     parser.add_argument(
-        "--strategy", choices=list(STRATEGIES.keys()), default="smart",
+        "docs_dir", type=Path, help="Path to the documentation directory"
+    )
+    parser.add_argument(
+        "output_dirs",
+        type=Path,
+        nargs="+",
+        help="Output directories for generated skills (e.g. .agents/skills/ .claude/skills/)",
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=list(STRATEGIES.keys()),
+        default="smart",
         help="Grouping strategy (default: smart)",
     )
     parser.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="Show what would be generated without writing files",
     )
     parser.add_argument(
-        "--prefix", default="",
+        "--prefix",
+        default="",
         help="Prefix for all skill names (e.g. 'nemoclaw')",
     )
     parser.add_argument(
-        "--name-map", nargs="*", default=[], metavar="CAT=NAME",
+        "--name-map",
+        nargs="*",
+        default=[],
+        metavar="CAT=NAME",
         help="Override names: --name-map about=overview deployment=deploy-remote",
     )
     parser.add_argument(
-        "--exclude", nargs="*", default=[],
+        "--exclude",
+        nargs="*",
+        default=[],
         help="Additional file patterns to exclude",
     )
 
@@ -1097,8 +1509,10 @@ def main():
     name_overrides: dict[str, str] = {}
     for mapping in args.name_map:
         if "=" not in mapping:
-            print(f"Error: --name-map entries must be CAT=NAME, got '{mapping}'",
-                  file=sys.stderr)
+            print(
+                f"Error: --name-map entries must be CAT=NAME, got '{mapping}'",
+                file=sys.stderr,
+            )
             sys.exit(1)
         cat, _, nm = mapping.partition("=")
         name_overrides[cat.strip()] = nm.strip()
@@ -1150,7 +1564,8 @@ def main():
     skill_names: dict[str, str] = {}  # group_name → skill_name
     for group_name, group_pages in sorted(groups.items()):
         sname = generate_skill_name(
-            group_name, group_pages,
+            group_name,
+            group_pages,
             prefix=args.prefix,
             name_overrides=name_overrides,
         )
@@ -1166,18 +1581,60 @@ def main():
             except ValueError:
                 pass
 
+    # Published-URL fallback for inter-doc links that do not map to a
+    # generated skill. Read from Sphinx's conf.py so the script stays
+    # project-agnostic — any docs tree with an html_baseurl assignment
+    # will just work.
+    html_baseurl = load_html_baseurl(docs_dir_resolved)
+    if html_baseurl is None:
+        print(
+            f"  warning: no html_baseurl found in {docs_dir_resolved}/conf.py; "
+            "inter-doc links without a skill mapping will be stripped to plain "
+            "text to keep skills self-contained.",
+            file=sys.stderr,
+        )
+
     # Generate skills
-    print(f"\n{'[DRY RUN] ' if args.dry_run else ''}Generating skills to {args.output_dir}/")
+    dirs_str = ", ".join(str(d) for d in args.output_dirs)
+    print(f"\n{'[DRY RUN] ' if args.dry_run else ''}Generating skills to {dirs_str}")
     summaries: list[dict] = []
     for group_name, group_pages in sorted(groups.items()):
         name = skill_names[group_name]
         summary = generate_skill(
-            name, group_pages, args.output_dir,
+            name,
+            group_pages,
+            args.output_dirs,
             docs_dir=docs_dir_resolved,
             doc_to_skill=doc_to_skill,
+            html_baseurl=html_baseurl,
             dry_run=args.dry_run,
         )
         summaries.append(summary)
+
+    # Ensure .claude/skills symlink exists
+    if not args.dry_run:
+        claude_skills = Path(".claude/skills")
+        for out_dir in args.output_dirs:
+            # Only create symlink if output is under .agents/skills
+            if ".agents/skills" in str(out_dir):
+                agents_skills = Path(out_dir)
+                if claude_skills.is_symlink():
+                    if claude_skills.resolve() == agents_skills.resolve():
+                        break  # already correct
+                    else:
+                        claude_skills.unlink()
+                elif claude_skills.is_dir():
+                    print(f"\n⚠ {claude_skills} is a real directory, not a symlink.")
+                    print(
+                        f"  Remove it and re-run, or manually symlink to {agents_skills}"
+                    )
+                    break
+                # Create parent and symlink
+                claude_skills.parent.mkdir(parents=True, exist_ok=True)
+                rel = os.path.relpath(agents_skills, claude_skills.parent)
+                claude_skills.symlink_to(rel)
+                print(f"\n✔ Created symlink: {claude_skills} → {rel}")
+                break
 
     # Report
     print("\n" + "=" * 60)
@@ -1194,7 +1651,9 @@ def main():
         warning = " ⚠ >500 lines" if lines > 500 else ""
         print(f"  {s['name']:30s}  {lines:4d} lines  {refs} refs{warning}{status}")
 
-    print(f"\nTotal: {len(summaries)} skills, {total_lines} lines, {total_refs} reference files")
+    print(
+        f"\nTotal: {len(summaries)} skills, {total_lines} lines, {total_refs} reference files"
+    )
 
     if any(s["skill_md_lines"] > 500 for s in summaries):
         print("\nNote: Skills over 500 lines should be trimmed. Move detailed")
@@ -1203,7 +1662,7 @@ def main():
 
     if args.dry_run:
         print("\nDry run complete. No files were written.")
-        print(f"Re-run without --dry-run to generate skills in {args.output_dir}/")
+        print(f"Re-run without --dry-run to generate skills in {dirs_str}")
 
 
 if __name__ == "__main__":

@@ -1,23 +1,27 @@
-.PHONY: check lint format lint-ts lint-py format-ts format-py docs docs-strict docs-live docs-clean
+.PHONY: check lint format lint-ts format-ts check-installer-hash docs docs-strict docs-live docs-clean
 
-check: lint-ts lint-py
+check:
+	npx prek run --all-files
 	@echo "All checks passed."
 
-lint: lint-ts lint-py
+lint: check
 
+# Targeted subproject checks (not part of `make check` — use for focused runs).
 lint-ts:
 	cd nemoclaw && npm run check
 
-lint-py:
-	cd nemoclaw-blueprint && $(MAKE) check
+format: format-ts format-cli
 
-format: format-ts format-py
+format-cli:
+	npx prettier --write 'bin/**/*.js' 'test/**/*.js'
 
 format-ts:
 	cd nemoclaw && npm run lint:fix && npm run format
 
-format-py:
-	cd nemoclaw-blueprint && $(MAKE) format
+# --- Integrity checks ---
+
+check-installer-hash:
+	bash scripts/check-installer-hash.sh
 
 # --- Documentation ---
 
